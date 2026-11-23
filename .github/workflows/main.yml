@@ -1,0 +1,364 @@
+name: RDP 6 hour
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: rdp-session
+  cancel-in-progress: false
+
+jobs:
+  rdp:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      GH_PAT: ${{ secrets.RESTART_PAT }}
+
+    steps:
+      - name: Init
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value "JOB_START=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+
+      - name: Enable RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-3389" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-3389" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create user
+        run: |
+          $password = $env:RDP_PASSWORD
+          if ([string]::IsNullOrEmpty($password)) { Write-Error "Secret RDP_PASSWORD is missing"; exit 1 }
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+      - name: Install Tailscale
+        run: |
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installer -Force
+
+      - name: Connect Tailscale
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if ([string]::IsNullOrEmpty($env:TS_AUTHKEY)) { Write-Error "Secret TS_AUTHKEY is missing"; exit 1 }
+          & $ts up --authkey="$env:TS_AUTHKEY" --hostname="gh-runner-$env:GITHUB_RUN_ID"
+          $ip = $null
+          for ($i = 0; $i -lt 10 -and -not $ip; $i++) {
+              $ip = & $ts ip -4
+              Start-Sleep -Seconds 5
+          }
+          if (-not $ip) { Write-Error "No Tailscale IP"; exit 1 }
+          Add-Content -Path $env:GITHUB_ENV -Value "TS_IP=$ip"
+
+      - name: Add Arabic keyboard (Alt+Shift to switch)
+        continue-on-error: true
+        run: |
+          # Applies to the RDP user's profile, which is created from the Default profile at first logon
+          reg load HKU\DefaultUser C:\Users\Default\NTUSER.DAT
+          $root = "Registry::HKEY_USERS\DefaultUser"
+
+          # Classic keyboard layout list: English (US) + Arabic (101)
+          $pre = "$root\Keyboard Layout\Preload"
+          New-Item -Path $pre -Force | Out-Null
+          Set-ItemProperty -Path $pre -Name "1" -Value "00000409"
+          Set-ItemProperty -Path $pre -Name "2" -Value "00000401"
+
+          # Alt+Shift to switch languages
+          $tog = "$root\Keyboard Layout\Toggle"
+          New-Item -Path $tog -Force | Out-Null
+          Set-ItemProperty -Path $tog -Name "Hotkey" -Value "1"
+          Set-ItemProperty -Path $tog -Name "Language Hotkey" -Value "1"
+          Set-ItemProperty -Path $tog -Name "Layout Hotkey" -Value "2"
+
+          # At first logon, also register the languages in the modern language list
+          $run = "$root\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+          New-Item -Path $run -Force | Out-Null
+          Set-ItemProperty -Path $run -Name "ArabicKeyboard" -Value 'powershell.exe -NoProfile -WindowStyle Hidden -Command "Set-WinUserLanguageList -LanguageList en-US,ar-IQ -Force"'
+
+          [gc]::Collect()
+          Start-Sleep -Seconds 2
+          reg unload HKU\DefaultUser
+
+      - name: Enable Windows audio + RDP audio redirection
+        continue-on-error: true
+        run: |
+          # 1) Audio services: automatic + running (they are disabled/manual on Server)
+          foreach ($svc in "AudioEndpointBuilder","Audiosrv") {
+              Set-Service -Name $svc -StartupType Automatic -ErrorAction SilentlyContinue
+              & sc.exe config $svc start= auto | Out-Null
+          }
+          Start-Service -Name AudioEndpointBuilder -ErrorAction SilentlyContinue
+          Start-Service -Name Audiosrv -ErrorAction SilentlyContinue
+
+          # 2) Make sure RDP is allowed to redirect audio (policy + local settings)
+          $paths = @(
+            'HKLM:\System\CurrentControlSet\Control\Terminal Server',
+            'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp',
+            'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          )
+          foreach ($path in $paths) {
+              if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+              foreach ($name in "fDisableAudioRedirection","fDisableAudioCapture","fDisableCam") {
+                  Set-ItemProperty -Path $path -Name $name -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+              }
+          }
+
+          # 3) Windows Audio must be able to start inside the session
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Audiosrv' -Name Start -Value 2 -Type DWord -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\AudioEndpointBuilder' -Name Start -Value 2 -Type DWord -Force -ErrorAction SilentlyContinue
+
+          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+          Get-Service Audiosrv,AudioEndpointBuilder,TermService | Format-Table Name,Status,StartType
+
+      - name: Session settings (Baghdad time, no sleep, no idle logoff)
+        continue-on-error: true
+        run: |
+          Set-TimeZone -Id "Arabian Standard Time"
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+          $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          if (-not (Test-Path $ts)) { New-Item -Path $ts -Force | Out-Null }
+          foreach ($n in "MaxIdleTime","MaxDisconnectionTime","MaxConnectionTime") {
+              Set-ItemProperty -Path $ts -Name $n -Value 0 -Type DWord -Force
+          }
+
+      - name: Performance tuning (less CPU load, no background junk)
+        continue-on-error: true
+        run: |
+          # Defender real-time scanning eats CPU while downloading (disposable machine)
+          try {
+              Set-MpPreference -DisableRealtimeMonitoring $true -DisableBehaviorMonitoring $true -DisableIOAVProtection $true -DisableScriptScanning $true
+          } catch { Write-Host "Defender tuning skipped: $_" }
+
+          # Background services that waste CPU/disk on a short-lived machine
+          foreach ($svc in "WSearch","SysMain","wuauserv","UsoSvc","DiagTrack","WerSvc") {
+              Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+              Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+
+          # Browsers: no background mode / startup boost, and no GPU emulation (this VM has no GPU)
+          foreach ($k in 'HKLM:\SOFTWARE\Policies\Microsoft\Edge','HKLM:\SOFTWARE\Policies\BraveSoftware\Brave') {
+              New-Item -Path $k -Force | Out-Null
+              foreach ($n in "StartupBoostEnabled","BackgroundModeEnabled","HardwareAccelerationModeEnabled") {
+                  Set-ItemProperty -Path $k -Name $n -Value 0 -Type DWord -Force
+              }
+          }
+
+          # RDP server: lighter graphics encoding, no wallpaper
+          $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          if (-not (Test-Path $ts)) { New-Item -Path $ts -Force | Out-Null }
+          Set-ItemProperty -Path $ts -Name "AVC444ModePreferred" -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $ts -Name "fNoRemoteDesktopWallpaper" -Value 1 -Type DWord -Force
+
+          # Light visual effects for the RDP user's profile
+          reg load HKU\DefaultUser C:\Users\Default\NTUSER.DAT
+          $root = "Registry::HKEY_USERS\DefaultUser"
+          function Set-U($path, $name, $value, $type) {
+              New-Item -Path "$root\$path" -Force | Out-Null
+              Set-ItemProperty -Path "$root\$path" -Name $name -Value $value -Type $type -Force
+          }
+          Set-U 'Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' 'VisualFXSetting' 2 DWord
+          Set-U 'Control Panel\Desktop' 'MenuShowDelay' '0' String
+          Set-U 'Control Panel\Desktop' 'DragFullWindows' '0' String
+          Set-U 'Control Panel\Desktop\WindowMetrics' 'MinAnimate' '0' String
+          Set-U 'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'TaskbarAnimations' 0 DWord
+          Set-U 'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'ListviewAlphaSelect' 0 DWord
+          Set-U 'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' 'ListviewShadow' 0 DWord
+          [gc]::Collect()
+          Start-Sleep -Seconds 2
+          reg unload HKU\DefaultUser
+
+          Write-Host "Logical processors: $env:NUMBER_OF_PROCESSORS"
+
+      - name: Install virtual sound card (VB-Cable) as backup audio device
+        continue-on-error: true
+        run: |
+          function Test-Cable { [bool](Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -match "VB-Audio|CABLE" }) }
+
+          # Try 1: Chocolatey
+          choco install vb-cable -y --no-progress --ignore-checksums
+
+          # Try 2: direct download + trust the publisher certificate + silent install
+          if (-not (Test-Cable)) {
+              Write-Host "Choco install did not register the device, trying direct install..."
+              $d = "$env:TEMP\vbcable"
+              New-Item -ItemType Directory -Path $d -Force | Out-Null
+              Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip" -OutFile "$d\vb.zip"
+              Expand-Archive -Path "$d\vb.zip" -DestinationPath $d -Force
+              Get-ChildItem $d -Filter *.cat -Recurse | ForEach-Object {
+                  $cert = (Get-AuthenticodeSignature $_.FullName).SignerCertificate
+                  if ($cert) {
+                      $cer = Join-Path $d "signer.cer"
+                      [IO.File]::WriteAllBytes($cer, $cert.Export('Cert'))
+                      certutil -addstore -f TrustedPublisher $cer | Out-Null
+                  }
+              }
+              $setup = Get-ChildItem $d -Filter "VBCABLE_Setup_x64.exe" -Recurse | Select-Object -First 1
+              Start-Process -FilePath $setup.FullName -ArgumentList "-i","-h" -Wait
+              Start-Sleep -Seconds 5
+          }
+
+          Restart-Service -Name Audiosrv -Force -ErrorAction SilentlyContinue
+          Write-Host "VB-Cable installed: $(Test-Cable)"
+          Get-PnpDevice -Class AudioEndpoint,MEDIA -ErrorAction SilentlyContinue | Format-Table Status,Class,FriendlyName
+
+      - name: Show connection info (connect now, apps keep installing)
+        run: |
+          Write-Host ""
+          Write-Host "=== RDP READY ==="
+          Write-Host "Address : $env:TS_IP"
+          Write-Host "Username: RDP"
+          Write-Host "================="
+          Write-Host "Logical processors: $env:NUMBER_OF_PROCESSORS"
+          Get-PSDrive -PSProvider FileSystem | ForEach-Object { Write-Host ("Drive {0}: {1} GB free" -f $_.Name, [math]::Round($_.Free/1GB,1)) }
+          Write-Host ("RAM: {0} GB" -f [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1GB,1))
+
+          if ($env:NTFY_TOPIC) {
+              try {
+                  Invoke-RestMethod -Uri "https://ntfy.sh/$env:NTFY_TOPIC" -Method Post -Body "Address: $env:TS_IP  |  User: RDP" -Headers @{ Title = "RDP is ready"; Tags = "computer" } | Out-Null
+              } catch { Write-Host "ntfy failed: $_" }
+          }
+
+      - name: Install WinRAR and FDM
+        continue-on-error: true
+        run: |
+          choco install winrar freedownloadmanager -y --no-progress --ignore-checksums
+
+      - name: Install Brave (system-wide for all users)
+        continue-on-error: true
+        run: |
+          $paths = @("$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe",
+                     "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser\Application\brave.exe")
+          function Find-Brave { $paths | Where-Object { Test-Path $_ } | Select-Object -First 1 }
+
+          function Wait-Brave($seconds) {
+              for ($i = 0; $i -lt $seconds / 5 -and -not (Find-Brave); $i++) { Start-Sleep -Seconds 5 }
+          }
+
+          # Try 1: official installer, silent, system-level (runner is admin)
+          $setup = "$env:TEMP\BraveSetup.exe"
+          Invoke-WebRequest -Uri "https://laptop-updates.brave.com/latest/winx64" -OutFile $setup
+          Start-Process -FilePath $setup -ArgumentList "/silent","/install" -Wait
+          Wait-Brave 240
+
+          # Try 2: Chocolatey
+          if (-not (Find-Brave)) {
+              Write-Host "Official installer did not finish, trying Chocolatey..."
+              choco install brave -y --no-progress --ignore-checksums
+              Wait-Brave 180
+          }
+
+          $brave = Find-Brave
+          if ($brave) {
+              Write-Host "Brave installed at: $brave"
+              $ws = New-Object -ComObject WScript.Shell
+              $lnk = $ws.CreateShortcut("C:\Users\Public\Desktop\Brave.lnk")
+              $lnk.TargetPath = $brave
+              $lnk.Save()
+          } else {
+              Write-Error "Brave was NOT installed"
+              exit 1
+          }
+
+      - name: Debloat (remove Edge, Chrome, Firefox, unused apps, services and tasks)
+        continue-on-error: true
+        run: |
+          function Disable-Svc($pattern) {
+              Get-Service -Name $pattern -ErrorAction SilentlyContinue | ForEach-Object {
+                  Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
+                  Set-Service -Name $_.Name -StartupType Disabled -ErrorAction SilentlyContinue
+              }
+          }
+
+          # --- Remove Microsoft Edge (WebView2 is kept: other apps need it) ---
+          Get-Process msedge,msedgewebview2 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          $edge = Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\*\Installer\setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($edge) {
+              Start-Process -FilePath $edge.FullName -ArgumentList "--uninstall","--system-level","--verbose-logging","--force-uninstall" -Wait
+          }
+          New-Item -Path 'HKLM:\SOFTWARE\Microsoft\EdgeUpdate' -Force | Out-Null
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\EdgeUpdate' -Name "DoNotUpdateToEdgeWithChromium" -Value 1 -Type DWord -Force
+          Remove-Item "$env:PUBLIC\Desktop\Microsoft Edge.lnk" -Force -ErrorAction SilentlyContinue
+
+          # --- Remove Chrome and Firefox (Brave is the browser) ---
+          $chrome = Get-ChildItem "$env:ProgramFiles\Google\Chrome\Application\*\Installer\setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($chrome) {
+              Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+              Start-Process -FilePath $chrome.FullName -ArgumentList "--uninstall","--system-level","--force-uninstall" -Wait
+          }
+          $ff = "$env:ProgramFiles\Mozilla Firefox\uninstall\helper.exe"
+          if (Test-Path $ff) { Start-Process -FilePath $ff -ArgumentList "-ms" -Wait }
+
+          # --- Unneeded services (updaters, spooler, databases, web servers, telemetry) ---
+          foreach ($svc in "edgeupdate","edgeupdatem","gupdate","gupdatem","MozillaMaintenance","Spooler","DoSvc","MapsBroker","lfsvc","CDPSvc","docker","MySQL*","postgresql*","MongoDB*","MSSQL*","SQLAgent*","SQLWriter","W3SVC","WAS","Apache*","jenkins*") {
+              Disable-Svc $svc
+          }
+
+          # --- Scheduled tasks that wake up and burn CPU ---
+          Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
+              $_.TaskName -match 'MicrosoftEdgeUpdate|GoogleUpdate|Mozilla|ServerManager|Compatibility Appraiser|ProgramDataUpdater|StartupAppTask|ScheduledDefrag|WinSAT' -or
+              $_.TaskPath -match 'Application Experience|Customer Experience|Windows Error Reporting|DiskDiagnostic|Defrag'
+          } | Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+
+          # --- Server Manager popup at logon ---
+          New-Item -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager' -Force | Out-Null
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager' -Name "DoNotOpenServerManagerAtLogon" -Value 1 -Type DWord -Force
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager' -Name "DoNotPopWACConsoleAtSMLaunch" -Value 1 -Type DWord -Force
+
+          # --- Store apps / bloat packages (exact names; system/shell components are never touched) ---
+          $bloat = "Microsoft.BingWeather","Microsoft.BingNews","Microsoft.GamingApp","Microsoft.XboxApp","Microsoft.Xbox.TCUI","Microsoft.XboxGamingOverlay","Microsoft.XboxIdentityProvider","Microsoft.XboxSpeechToTextOverlay","Microsoft.ZuneMusic","Microsoft.ZuneVideo","Microsoft.MicrosoftSolitaireCollection","Microsoft.Office.OneNote","Microsoft.SkypeApp","Microsoft.GetHelp","Microsoft.Getstarted","Microsoft.WindowsFeedbackHub","Microsoft.WindowsMaps","Microsoft.YourPhone","Microsoft.People","Microsoft.MixedReality.Portal","Microsoft.Microsoft3DViewer","Microsoft.MicrosoftOfficeHub"
+          foreach ($b in $bloat) {
+              Get-AppxPackage -AllUsers -Name $b -ErrorAction SilentlyContinue |
+                  Where-Object { -not $_.NonRemovable -and $_.SignatureKind -ne 'System' } |
+                  Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+              Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DisplayName -eq $b } |
+                  Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Out-Null
+          }
+
+          # --- High performance power plan ---
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+
+          Write-Host "Edge still present: $(Test-Path "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe")"
+
+      - name: Keep alive (runs until you cancel it or GitHub's 6-hour limit)
+        run: |
+          $maxMinutes = 345   # only used if the optional RESTART_PAT secret exists
+          $start = [DateTimeOffset]::FromUnixTimeSeconds([long]$env:JOB_START)
+          while ($true) {
+              Start-Sleep -Seconds 300
+              $elapsed = ([DateTimeOffset]::UtcNow - $start).TotalMinutes
+              Write-Host "[$(Get-Date)] RDP at $env:TS_IP | elapsed=$([int]$elapsed) min"
+              if ($env:GH_PAT -and $elapsed -ge $maxMinutes) {
+                  Add-Content -Path $env:GITHUB_ENV -Value "RESTART_NEXT=true"
+                  break
+              }
+          }
+
+      - name: Start next session (only if RESTART_PAT secret exists)
+        if: ${{ env.RESTART_NEXT == 'true' && env.GH_PAT != '' }}
+        run: |
+          $wf = (($env:GITHUB_WORKFLOW_REF -split '@')[0]) -replace '^.*/\.github/workflows/',''
+          $body = @{ ref = $env:GITHUB_REF_NAME } | ConvertTo-Json
+          Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/actions/workflows/$wf/dispatches" `
+            -Headers @{ Authorization = "Bearer $env:GH_PAT"; Accept = "application/vnd.github+json"; "X-GitHub-Api-Version" = "2022-11-28" } `
+            -Body $body -ContentType "application/json"
+          if ($env:NTFY_TOPIC) {
+              try { Invoke-RestMethod -Uri "https://ntfy.sh/$env:NTFY_TOPIC" -Method Post -Body "Session ending. A new one is starting, you will get the new address in a few minutes." -Headers @{ Title = "RDP restarting" } | Out-Null } catch {}
+          }
+
+      - name: Notify end
+        if: ${{ always() && env.NTFY_TOPIC != '' }}
+        run: |
+          try { Invoke-RestMethod -Uri "https://ntfy.sh/$env:NTFY_TOPIC" -Method Post -Body "The RDP session has ended." -Headers @{ Title = "RDP ended" } | Out-Null } catch {}
